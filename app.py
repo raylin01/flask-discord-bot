@@ -1,76 +1,230 @@
+# -*- coding: UTF-8 -*-
+#  Copyright (c) polakowo
+#  Licensed under the MIT license.
+# !pip install python-telegram-bot --upgrade
+from functools import wraps
+import configparser
+import argparse
+import requests
+from urllib.parse import urlencode
+import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+from functools import partial
+import random
+import re
+import discord
+from discord import Webhook, RequestsWebhookAdapter
+
+from model import download_model_folder, download_reverse_model_folder, load_model
+from decoder import generate_response
+
 from threading import Thread
+import time 
+from queue import Queue
 
+from flask_ngrok import run_with_ngrok
 from flask import Flask
-from flask_admin import Admin
-from flask_admin.contrib.sqla import ModelView
-from flask_sqlalchemy import SQLAlchemy
+from flask import request
 
-import bot
-import settings
-
-# Make a thread for our bot to run on.
-t = Thread(target=bot.run)
-t.start()
-
-# Create our app
 app = Flask(__name__)
-app.secret_key = settings.APP_SECRET_KEY
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-# Let's create a database
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///{}'.format(settings.DATABASE_FILE)
-db = SQLAlchemy(app)
+run_with_ngrok(app)   #starts ngrok when the app is run
+partial_run = partial(app.run)
 
 
-# User model
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(64), unique=True)
-    user_num = db.Column(db.Integer, unique=True, autoincrement=True)
-    permissions = db.Column(db.Integer)
+#room codes
+gpt_chat = 719063737448923179
+chat_42 = 719260820047134735
 
-    def __init__(self, name, user_num, permissions=0):
-        self.name = name
-        self.user_num = user_num
-        self.permissions = permissions
+# webhooks
+webhook_george = Webhook.partial(719428372505296958, 'D2hS4XA5h9_77ukbTaVzgGZhz2AcgTX1RBKWbDvB3YoJUM9Bq6FzOotC4cIaT305CtvX', adapter=RequestsWebhookAdapter())
+webhook_user = Webhook.partial(719428467103629342, 'etl6AYTwkHg33tX2gogujpRHcjK9KIdHAF5r8SDg3v6ukHiLyP9-OEdUBD0ja9zOi-ML', adapter=RequestsWebhookAdapter())
 
-    def __str__(self):
-        return self.name
+client = discord.Client()
+config = ""
+context = {}
+model = ""
+tokenizer = ""
+mmi_model= ""
+mmi_tokenizer=""
 
-    def __repr__(self):
-        return f'<User: {self.name}>'
+# https://github.com/python-telegram-bot/python-telegram-bot/wiki/Code-snippets
+
+def requests_retry_session(
+    retries=3,
+    backoff_factor=0.3,
+    status_forcelist=(500, 502, 504),
+    session=None,
+):
+    session = session or requests.Session()
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
+def translate_message_to_gif(message, config):
+    # https://engineering.giphy.com/contextually-aware-search-giphy-gets-work-specific/
+    params = {
+        'api_key': config.get('chatbot', 'giphy_token'),
+        's': message,
+        'weirdness': config.getint('chatbot', 'giphy_weirdness')
+    }
+    url = "http://api.giphy.com/v1/gifs/translate?" + urlencode(params)
+    response = requests_retry_session().get(url)
+    return response.json()['data']['images']['fixed_height']['url']
+
+def self_decorator(self, func):
+    """Passes bot object to func command."""
+    # TODO: Any other ways to pass variables to handlers?
+    def command_func(update, context, *args, **kwargs):
+        return func(self, update, context, *args, **kwargs)
+    return command_func
+
+def send_action(action):
+    """Sends `action` while processing func command."""
+    def decorator(func):
+        @wraps(func)
+        def command_func(self, update, context, *args, **kwargs):
+            context.bot.send_chat_action(chat_id=update.effective_message.chat_id, action=action)
+            return func(self, update, context, *args, **kwargs)
+        return command_func
+    return decorator
+
+def gpt_normalize(txt):
+    txt = re.sub(r"[^A-Za-z0-9()\[\]:,.!?'“”\"]", " ", txt) # remove illegal chars
+    return ' '.join(txt.strip().split()) # remove unnecessary spaces
+
+def main():
+    global config
+    global model
+    global tokenizer
+    global mmi_model
+    global mmi_tokenizer
+
+    # Script arguments can include path of the config
+    arg_parser = argparse.ArgumentParser()
+    arg_parser.add_argument('--config', type=str, default="chatbot.cfg")
+    args = arg_parser.parse_args()
+
+    # Read the config
+    config = configparser.ConfigParser(allow_no_value=True)
+    with open(args.config) as f:
+        config.read_file(f)
+
+    # Download and load main model
+    target_folder_name = download_model_folder(config)
+    model, tokenizer = load_model(target_folder_name, config)
+
+    # Download and load reverse model
+    use_mmi = config.getboolean('model', 'use_mmi')
+    if use_mmi:
+        mmi_target_folder_name = download_reverse_model_folder(config)
+        mmi_model, mmi_tokenizer = load_model(mmi_target_folder_name, config)
+    else:
+        mmi_model = None
+        mmi_tokenizer = None
+    
+    # Run Telegram bot
+    #bot = TelegramBot(model, tokenizer, config, mmi_model=mmi_model, mmi_tokenizer=mmi_tokenizer)
+    #bot.run_chat()
+    #client.loop.create_task(my_background_task())
+    t = Thread(target=partial_run)
+    t.start()
+    client.run(config.get('chatbot', 'discord_token'))
 
 
-class BotCommand(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(64), unique=True)
-    command_send = db.Column(db.String(100))
+@app.route('/newuser')
+def flask_new_user():
+    data = request.args
+    webhook_george.send("New chat with: " + data['user'], username='GeorgeTheBot')
+    return 'Updated User'
 
-    def __str__(self):
-        return self.name
+@app.route('/onmessage')
+def flask_on_message():
+    data = request.args
+    webhook_user.send(data['message'], username=data['user'])
+    message_to_send = discord_message(data['message'])
+    webhook_george.send(message_to_send, username='GeorgeTheBot')
+    return message_to_send
 
+@client.event
+async def on_message(message): #when someone sends a message
+    if message.channel.id == gpt_chat and message.author != client.user:
+        #await message.channel.send("test on message") #send a good morning message
+        await message.channel.send(discord_message(message.content))
 
-class Answers(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    answer = db.Column(db.String(100), unique=True)
+def discord_message(message):
+    global config
+    global context
+    # Parse parameters
+    num_samples = config.getint('decoder', 'num_samples')
+    max_turns_history = config.getint('decoder', 'max_turns_history')
+    if 'turns' not in context:
+        context['turns'] = []
+    turns = context['turns']
 
-    def __str__(self):
-        return self.answer
+    user_message = message
+    if user_message.lower() == 'bye':
+        # Restart chat
+        context['turns'] = []
+        return "Bye"
+    return_gif = False
+    if '@gif' in user_message:
+        # Return gif
+        return_gif = True
+        user_message = user_message.replace('@gif', '').strip()
+    if max_turns_history == 0:
+        # If you still get different responses then set seed
+        context['turns'] = []
+    # A single turn is a group of user messages and bot responses right after
+    turn = {
+        'user_messages': [],
+        'bot_messages': []
+    }
+    turns.append(turn)
+    turn['user_messages'].append(user_message)
+    #logger.info(f"{update.effective_message.chat_id} - User >>> {user_message}")
+    # Merge turns into a single history (don't forget EOS token)
+    history = ""
+    from_index = max(len(turns)-max_turns_history-1, 0) if max_turns_history >= 0 else 0
+    for turn in turns[from_index:]:
+        # Each turn begings with user messages
+        for messagex in turn['user_messages']:
+            history += gpt_normalize(messagex) + tokenizer.eos_token
+        for messagex in turn['bot_messages']:
+            history += gpt_normalize(messagex) + tokenizer.eos_token
 
-
-# App routes
-@app.route('/')
-def index():
-    return '<a href="/admin/">Admin</a>'
-
-
-# Build database
-db.create_all()
-
-# Admin model
-admin = Admin(app, name='flask-discord-bot', template_mode='bootstrap3')
-
-# Admin views
-admin.add_view(ModelView(User, db.session))
-admin.add_view(ModelView(Answers, db.session))
-admin.add_view(ModelView(BotCommand, db.session))
+    # Generate bot messages
+    bot_messages = generate_response(
+        model, 
+        tokenizer, 
+        history, 
+        config, 
+        mmi_model, 
+        mmi_tokenizer
+    )
+    if num_samples == 1:
+        bot_message = bot_messages[0]
+    else:
+        # TODO: Select a message that is the most appropriate given the context
+        # This way you can avoid loops
+        bot_message = random.choice(bot_messages)
+    turn['bot_messages'].append(bot_message)
+    #logger.info(f"{update.effective_message.chat_id} - Bot >>> {bot_message}")
+    if return_gif:
+        # Return response as GIF
+        gif_url = translate_message_to_gif(bot_message, config)
+        return gif_url
+    else:
+        # Return response as text
+        #update.message.reply_text(bot_message)
+        return bot_message
+if __name__ == '__main__':
+    main()
